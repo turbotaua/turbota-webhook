@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 import httpx
 from fastapi import FastAPI, Request, Response
 
@@ -16,7 +17,7 @@ def bot_mentioned(text: str) -> bool:
     return f"@{BOT_USERNAME}" in text.lower()
 
 
-async def send_to_agent(text: str, metadata: dict | None = None):
+async def send_to_agent(text: str, metadata: Optional[dict] = None):
     """Send a message to Base44 agent via REST API."""
     url = f"{BASE44_BASE}/conversations/{CONV_ID}/messages"
     body = {"content": text, "role": "user"}
