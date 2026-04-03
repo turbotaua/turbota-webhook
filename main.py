@@ -48,6 +48,25 @@ def mark_user_active(user_id: int):
     active_users[user_id] = time.time() + ACTIVE_TIMEOUT
 
 
+def mark_user_done(user_id: int):
+    """Remove user from active conversations."""
+    active_users.pop(user_id, None)
+
+
+# Keywords that signal the agent has completed the operation
+DONE_KEYWORDS = [
+    "внесено", "записано", "створено", "проведено", "збережено",
+    "документ створен", "успішно", "готово", "виконано", "додано в dilovod",
+    "операцію внесено", "зафіксовано",
+]
+
+
+def is_conversation_done(reply: str) -> bool:
+    """Check if agent's reply signals task completion."""
+    lower = reply.lower()
+    return any(kw in lower for kw in DONE_KEYWORDS)
+
+
 async def send_to_agent(text: str) -> str:
     """Send message to Base44 agent, return agent's reply."""
     url = f"{BASE44_BASE}/conversations/{CONV_ID}/messages"
@@ -76,7 +95,7 @@ async def send_telegram(chat_id: int, text: str, thread_id: Optional[int] = None
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "turbota-webhook", "version": "4.1"}
+    return {"ok": True, "service": "turbota-webhook", "version": "5.0"}
 
 
 @app.post("/webhook")
@@ -122,8 +141,13 @@ async def webhook(request: Request):
         reply = await send_to_agent(prompt)
         if reply:
             await send_telegram(chat_id, reply, thread_id)
-            # Bot replied = conversation active, listen for follow-ups
-            mark_user_active(user_id)
+            if is_conversation_done(reply):
+                # Task complete — stop listening until next tag
+                mark_user_done(user_id)
+                print(f"[done] user={username} — conversation closed")
+            else:
+                # Bot asked follow-up — keep listening
+                mark_user_active(user_id)
         return Response(status_code=200)
 
     # --- PRIVATE: forward all messages ---
