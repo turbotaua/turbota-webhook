@@ -81,10 +81,9 @@ async def webhook(request: Request):
         if not bot_mentioned(text):
             return Response(status_code=200)
 
-        clean_text = text.replace(f"@{BOT_USERNAME}", "").strip()
         prompt = (
             f"[ГРУПА ОБЛІК] Від: {username} | Тред: {thread_id or 'загальний'}\n"
-            f"{clean_text}"
+            f"{text}"
         )
         print(f"[group] from={username} thread={thread_id} text={clean_text[:80]}")
         reply = await send_to_agent(prompt)
