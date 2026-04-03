@@ -1,19 +1,14 @@
 # Turbota Telegram Webhook
 
-Lightweight FastAPI webhook receiver for TURBOTA's Telegram group "Облік".
+Lightweight webhook relay: Telegram → Base44 Agent API.
 
-## What it does
-1. Receives all updates from Telegram
-2. Filters: only group -1001866962075, only messages mentioning @turbotaautomationbot
-3. Writes filtered messages to Base44 entity (TelegramProcessedMessage)
-4. Base44 automation fires → agent builds Dilovod/Finmap draft → replies in Telegram
+## How it works
+- Receives Telegram updates via webhook
+- **Group** (Облік): only processes messages with @turbotaautomationbot tag
+- **Private**: forwards all messages to the agent
+- Sends to Base44 agent via REST API with permanent `api_key`
 
 ## Deploy on Railway
-1. Push this folder to a GitHub repo
-2. Railway → New Project → Deploy from GitHub
-3. Set env var: BASE44_JWT=<your_jwt>
-4. Copy the Railway URL
-5. Set Telegram webhook: https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<railway-url>/webhook
-
-## Env vars required
-- BASE44_JWT — service role JWT token for Base44 API
+1. Connect this repo to Railway
+2. Set env vars: `BASE44_API_KEY`, `BASE44_CONV_ID` (optional)
+3. Set Telegram webhook: `https://api.telegram.org/bot{TOKEN}/setWebhook?url=https://{RAILWAY_URL}/webhook`
