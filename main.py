@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 from typing import Optional
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -16,8 +17,13 @@ BASE44_API_KEY = os.environ.get("BASE44_API_KEY", "")
 CONV_ID = os.environ.get("BASE44_CONV_ID", "")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# Supabase edge function for logging all group messages
+SUPABASE_LOG_URL = os.environ.get(
+    "SUPABASE_LOG_URL",
+    "https://xpuvfpuzpjapgdhficld.supabase.co/functions/v1/telegram-webhook-proxy",
+)
+
 # Track active conversations: {user_id: expiry_timestamp}
-# After bot asks a question, listen to that user for 10 minutes without tag
 active_users: dict[int, float] = {}
 ACTIVE_TIMEOUT = 600  # 10 minutes
 
@@ -27,7 +33,6 @@ def bot_mentioned(text: str) -> bool:
 
 
 def is_reply_to_bot(msg: dict) -> bool:
-    """Check if message is a reply to a bot message."""
     reply = msg.get("reply_to_message")
     if not reply:
         return False
@@ -35,7 +40,6 @@ def is_reply_to_bot(msg: dict) -> bool:
 
 
 def is_active_user(user_id: int) -> bool:
-    """Check if user has an active conversation (bot asked a question recently)."""
     expiry = active_users.get(user_id)
     if expiry and time.time() < expiry:
         return True
@@ -44,16 +48,13 @@ def is_active_user(user_id: int) -> bool:
 
 
 def mark_user_active(user_id: int):
-    """Mark user as having an active conversation."""
     active_users[user_id] = time.time() + ACTIVE_TIMEOUT
 
 
 def mark_user_done(user_id: int):
-    """Remove user from active conversations."""
     active_users.pop(user_id, None)
 
 
-# Keywords that signal the agent has completed the operation
 DONE_KEYWORDS = [
     "внесено", "записано", "створено", "проведено", "збережено",
     "документ створен", "успішно", "готово", "виконано", "додано в dilovod",
@@ -62,13 +63,21 @@ DONE_KEYWORDS = [
 
 
 def is_conversation_done(reply: str) -> bool:
-    """Check if agent's reply signals task completion."""
     lower = reply.lower()
     return any(kw in lower for kw in DONE_KEYWORDS)
 
 
+async def log_to_supabase(update: dict):
+    """Fire-and-forget: log the full Telegram update to Supabase for expense matching."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(SUPABASE_LOG_URL, json=update)
+            print(f"[supabase-log] {resp.status_code}")
+    except Exception as e:
+        print(f"[supabase-log] error: {e}")
+
+
 async def send_to_agent(text: str) -> str:
-    """Send message to Base44 agent, return agent's reply."""
     url = f"{BASE44_BASE}/conversations/{CONV_ID}/messages"
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
@@ -84,7 +93,6 @@ async def send_to_agent(text: str) -> str:
 
 
 async def send_telegram(chat_id: int, text: str, thread_id: Optional[int] = None):
-    """Send message back to Telegram chat."""
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if thread_id:
         payload["message_thread_id"] = thread_id
@@ -95,7 +103,7 @@ async def send_telegram(chat_id: int, text: str, thread_id: Optional[int] = None
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "turbota-webhook", "version": "5.0"}
+    return {"ok": True, "service": "turbota-webhook", "version": "6.0"}
 
 
 @app.post("/webhook")
@@ -117,9 +125,6 @@ async def webhook(request: Request):
     chat_type = chat.get("type", "")
     text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    if not text:
-        return Response(status_code=200)
-
     from_user = msg.get("from", {})
     user_id = from_user.get("id", 0)
     username = from_user.get("username") or f"{from_user.get('first_name', '')} {from_user.get('last_name', '')}".strip()
@@ -127,7 +132,14 @@ async def webhook(request: Request):
 
     # --- GROUP ---
     if chat_id == GROUP_CHAT_ID:
-        # Accept if: bot tagged, OR reply to bot message, OR user has active conversation
+        # LOG EVERY group message to Supabase (async, non-blocking)
+        # This feeds the Finmap expense matching system
+        asyncio.create_task(log_to_supabase(update))
+
+        if not text:
+            return Response(status_code=200)
+
+        # Only RESPOND if: bot tagged, reply to bot, or active conversation
         should_process = bot_mentioned(text) or is_reply_to_bot(msg) or is_active_user(user_id)
 
         if not should_process:
@@ -142,16 +154,16 @@ async def webhook(request: Request):
         if reply:
             await send_telegram(chat_id, reply, thread_id)
             if is_conversation_done(reply):
-                # Task complete — stop listening until next tag
                 mark_user_done(user_id)
                 print(f"[done] user={username} — conversation closed")
             else:
-                # Bot asked follow-up — keep listening
                 mark_user_active(user_id)
         return Response(status_code=200)
 
     # --- PRIVATE: forward all messages ---
     if chat_type == "private":
+        if not text:
+            return Response(status_code=200)
         prompt = f"[ПРИВАТНЕ] Від: {username}\n{text}"
         print(f"[private] from={username} text={text[:80]}")
         reply = await send_to_agent(prompt)
