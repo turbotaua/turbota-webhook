@@ -47,7 +47,7 @@ async def send_telegram(chat_id: int, text: str, thread_id: Optional[int] = None
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "turbota-webhook", "version": "3.0"}
+    return {"ok": True, "service": "turbota-webhook", "version": "3.1"}
 
 
 @app.post("/webhook")
