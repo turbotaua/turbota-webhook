@@ -10,10 +10,10 @@ app = FastAPI()
 GROUP_CHAT_ID = -1001866962075
 BOT_USERNAME = "turbotaautomationbot"
 BOT_ID = 8662984452
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 BASE44_BASE = os.environ.get("BASE44_BASE", "https://app.base44.com/api/agents/69cfa85cc1cb5d9be0b98f3c")
-BASE44_API_KEY = os.environ["BASE44_API_KEY"]
-CONV_ID = os.environ["BASE44_CONV_ID"]
+BASE44_API_KEY = os.environ.get("BASE44_API_KEY", "")
+CONV_ID = os.environ.get("BASE44_CONV_ID", "")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Track active conversations: {user_id: expiry_timestamp}
