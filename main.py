@@ -47,7 +47,7 @@ async def send_telegram(chat_id: int, text: str, thread_id: Optional[int] = None
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "turbota-webhook", "version": "3.1"}
+    return {"ok": True, "service": "turbota-webhook", "version": "3.2"}
 
 
 @app.post("/webhook")
@@ -85,7 +85,7 @@ async def webhook(request: Request):
             f"[ГРУПА ОБЛІК] Від: {username} | Тред: {thread_id or 'загальний'}\n"
             f"{text}"
         )
-        print(f"[group] from={username} thread={thread_id} text={clean_text[:80]}")
+        print(f"[group] from={username} thread={thread_id} text={text[:80]}")
         reply = await send_to_agent(prompt)
         if reply:
             await send_telegram(chat_id, reply, thread_id)
