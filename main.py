@@ -10,10 +10,10 @@ app = FastAPI()
 GROUP_CHAT_ID = -1001866962075
 BOT_USERNAME = "turbotaautomationbot"
 BOT_ID = 8662984452
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8662984452:AAGp7Ewudyv-kMRtmeiKdnv7iZD9mohpV9s")
-BASE44_BASE = "https://app.base44.com/api/agents/69cfa85cc1cb5d9be0b98f3c"
-BASE44_API_KEY = os.environ.get("BASE44_API_KEY", "cc98d8b4eca243de93f5eb9fd8b57d88")
-CONV_ID = os.environ.get("BASE44_CONV_ID", "69cfa85e6e1663b653e71819")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+BASE44_BASE = os.environ.get("BASE44_BASE", "https://app.base44.com/api/agents/69cfa85cc1cb5d9be0b98f3c")
+BASE44_API_KEY = os.environ["BASE44_API_KEY"]
+CONV_ID = os.environ["BASE44_CONV_ID"]
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Track active conversations: {user_id: expiry_timestamp}
@@ -76,7 +76,7 @@ async def send_telegram(chat_id: int, text: str, thread_id: Optional[int] = None
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "turbota-webhook", "version": "4.0"}
+    return {"ok": True, "service": "turbota-webhook", "version": "4.1"}
 
 
 @app.post("/webhook")
