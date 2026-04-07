@@ -1,28 +1,32 @@
 """
-TURBOTA Telegram Webhook v4 — with file support + smart grouping
-Architecture: Telegram → Railway (filter + file download + buffering) → relay to agent
-
-GROUPING LOGIC:
-- Files/messages from same user in same chat/thread within 4 seconds → grouped into ONE relay
-- This handles: sending 3 files one by one, sending text + files, album (media group), etc.
+TURBOTA Telegram Webhook v4.1 — file support + smart grouping
+Fixed: asyncio background tasks compatible with uvicorn/Railway
 """
 import os
 import asyncio
 import httpx
 from fastapi import FastAPI, Request, Response
-
-app = FastAPI()
+from contextlib import asynccontextmanager
 
 GROUP_CHAT_ID = -1001866962075
 BOT_USERNAME  = "turbotaautomationbot"
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
+TG_API        = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BUFFER_SECONDS = 4
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# Buffer: key = (chat_id, thread_id, user_id) → {"messages": [...], "task": asyncio.Task}
+# Buffer: key=(chat_id, thread_id, user_id) → {"entries": [...], "handle": TimerHandle}
 _buffer: dict = {}
-BUFFER_SECONDS = 4  # wait this long after last message before flushing
+_loop: asyncio.AbstractEventLoop = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _loop
+    _loop = asyncio.get_event_loop()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 
 def bot_mentioned(text: str) -> bool:
@@ -31,7 +35,7 @@ def bot_mentioned(text: str) -> bool:
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "turbota-webhook-v4"}
+    return {"ok": True, "service": "turbota-webhook", "version": "4.1"}
 
 
 @app.post("/webhook")
@@ -63,7 +67,8 @@ async def webhook(request: Request):
             should_forward = True
 
     if should_forward:
-        await buffer_message(msg, update.get("update_id"))
+        files = await extract_file_info(msg)
+        await buffer_message(msg, update.get("update_id"), files)
 
     return Response(status_code=200)
 
@@ -82,10 +87,8 @@ async def get_file_url(file_id: str) -> str | None:
 
 
 async def extract_file_info(msg: dict) -> list[dict]:
-    """Extract all files from a message. Returns list of {name, mime, url}"""
     files = []
 
-    # Document (Excel, PDF, Word, etc.)
     doc = msg.get("document")
     if doc:
         url = await get_file_url(doc["file_id"])
@@ -95,7 +98,6 @@ async def extract_file_info(msg: dict) -> list[dict]:
             "url": url or "[не вдалось отримати]"
         })
 
-    # Photo
     photos = msg.get("photo")
     if photos:
         photo = sorted(photos, key=lambda p: p.get("file_size", 0), reverse=True)[0]
@@ -109,18 +111,13 @@ async def extract_file_info(msg: dict) -> list[dict]:
     return files
 
 
-async def buffer_message(msg: dict, update_id):
-    """Buffer messages from same user/chat/thread and flush after BUFFER_SECONDS of silence."""
+async def buffer_message(msg: dict, update_id, files: list):
     from_user = msg.get("from", {})
     chat      = msg.get("chat", {})
     user_id   = from_user.get("id")
     chat_id   = chat.get("id")
     thread_id = msg.get("message_thread_id")
-
-    key = (chat_id, thread_id, user_id)
-
-    # Extract files now (async, before buffering)
-    files = await extract_file_info(msg)
+    key       = (chat_id, thread_id, user_id)
 
     entry = {
         "update_id": update_id,
@@ -134,23 +131,30 @@ async def buffer_message(msg: dict, update_id):
 
     _buffer[key]["entries"].append(entry)
 
-    # Cancel existing timer and restart
-    if _buffer[key]["task"] and not _buffer[key]["task"].done():
-        _buffer[key]["task"].cancel()
+    # Cancel existing timer
+    existing = _buffer[key].get("task")
+    if existing and not existing.done():
+        existing.cancel()
 
-    _buffer[key]["task"] = asyncio.create_task(flush_after_delay(key))
+    # Schedule flush
+    task = asyncio.create_task(flush_after_delay(key))
+    _buffer[key]["task"] = task
 
 
 async def flush_after_delay(key):
-    await asyncio.sleep(BUFFER_SECONDS)
-    await flush_buffer(key)
+    try:
+        await asyncio.sleep(BUFFER_SECONDS)
+        await flush_buffer(key)
+    except asyncio.CancelledError:
+        pass
 
 
 async def flush_buffer(key):
     if key not in _buffer:
         return
 
-    entries = _buffer.pop(key)["entries"]
+    data    = _buffer.pop(key)
+    entries = data["entries"]
     if not entries:
         return
 
@@ -165,21 +169,17 @@ async def flush_buffer(key):
     chat_type = chat.get("type")
     thread_id = first.get("message_thread_id")
 
-    # Collect all texts (skip duplicates/empty)
     texts = []
     for e in entries:
         if e["text"] and e["text"] not in texts:
             texts.append(e["text"])
 
-    # Collect all files
     all_files = []
     for e in entries:
         all_files.extend(e["files"])
 
-    # Collect message IDs
     msg_ids = [e["msg"]["message_id"] for e in entries]
 
-    # Build relay
     relay = (
         f"📨 TG_RELAY\n"
         f"update_id: {entries[-1]['update_id']}\n"
@@ -206,4 +206,4 @@ async def flush_buffer(key):
         )
         print(f"[flush] status={r.status_code} key={key} entries={len(entries)} files={len(all_files)}")
         if r.status_code != 200:
-            print(f"[flush] error: {r.text[:200]}")
+            print(f"[flush] error: {r.text[:300]}")
