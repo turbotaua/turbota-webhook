@@ -1,109 +1,37 @@
+"""
+TURBOTA Telegram Webhook v4 — with file support + smart grouping
+Architecture: Telegram → Railway (filter + file download + buffering) → relay to agent
+
+GROUPING LOGIC:
+- Files/messages from same user in same chat/thread within 4 seconds → grouped into ONE relay
+- This handles: sending 3 files one by one, sending text + files, album (media group), etc.
+"""
 import os
-import time
 import asyncio
-from typing import Optional
 import httpx
 from fastapi import FastAPI, Request, Response
 
 app = FastAPI()
 
-# --- Config ---
 GROUP_CHAT_ID = -1001866962075
-BOT_USERNAME = "turbotaautomationbot"
-BOT_ID = 8662984452
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-BASE44_BASE = os.environ.get("BASE44_BASE", "https://app.base44.com/api/agents/69cfa85cc1cb5d9be0b98f3c")
-BASE44_API_KEY = os.environ.get("BASE44_API_KEY", "")
-CONV_ID = os.environ.get("BASE44_CONV_ID", "")
+BOT_USERNAME  = "turbotaautomationbot"
+BOT_TOKEN     = os.environ["BOT_TOKEN"]
+OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
+
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# Supabase edge function for logging all group messages
-SUPABASE_LOG_URL = os.environ.get(
-    "SUPABASE_LOG_URL",
-    "https://xpuvfpuzpjapgdhficld.supabase.co/functions/v1/telegram-webhook-proxy",
-)
-
-# Track active conversations: {user_id: expiry_timestamp}
-active_users: dict[int, float] = {}
-ACTIVE_TIMEOUT = 600  # 10 minutes
+# Buffer: key = (chat_id, thread_id, user_id) → {"messages": [...], "task": asyncio.Task}
+_buffer: dict = {}
+BUFFER_SECONDS = 4  # wait this long after last message before flushing
 
 
 def bot_mentioned(text: str) -> bool:
-    return f"@{BOT_USERNAME}" in text.lower()
-
-
-def is_reply_to_bot(msg: dict) -> bool:
-    reply = msg.get("reply_to_message")
-    if not reply:
-        return False
-    return reply.get("from", {}).get("id") == BOT_ID
-
-
-def is_active_user(user_id: int) -> bool:
-    expiry = active_users.get(user_id)
-    if expiry and time.time() < expiry:
-        return True
-    active_users.pop(user_id, None)
-    return False
-
-
-def mark_user_active(user_id: int):
-    active_users[user_id] = time.time() + ACTIVE_TIMEOUT
-
-
-def mark_user_done(user_id: int):
-    active_users.pop(user_id, None)
-
-
-DONE_KEYWORDS = [
-    "внесено", "записано", "створено", "проведено", "збережено",
-    "документ створен", "успішно", "готово", "виконано", "додано в dilovod",
-    "операцію внесено", "зафіксовано",
-]
-
-
-def is_conversation_done(reply: str) -> bool:
-    lower = reply.lower()
-    return any(kw in lower for kw in DONE_KEYWORDS)
-
-
-async def log_to_supabase(update: dict):
-    """Fire-and-forget: log the full Telegram update to Supabase for expense matching."""
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.post(SUPABASE_LOG_URL, json=update)
-            print(f"[supabase-log] {resp.status_code}")
-    except Exception as e:
-        print(f"[supabase-log] error: {e}")
-
-
-async def send_to_agent(text: str) -> str:
-    url = f"{BASE44_BASE}/conversations/{CONV_ID}/messages"
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(
-            url,
-            headers={"api_key": BASE44_API_KEY, "Content-Type": "application/json"},
-            json={"content": text, "role": "user"},
-        )
-        print(f"[base44] {resp.status_code}")
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("content", "")
-    return ""
-
-
-async def send_telegram(chat_id: int, text: str, thread_id: Optional[int] = None):
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if thread_id:
-        payload["message_thread_id"] = thread_id
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(f"{TG_API}/sendMessage", json=payload)
-        print(f"[telegram] {resp.status_code}")
+    return f"@{BOT_USERNAME}".lower() in (text or "").lower()
 
 
 @app.get("/")
 def health():
-    return {"ok": True, "service": "turbota-webhook", "version": "6.0"}
+    return {"ok": True, "service": "turbota-webhook-v4"}
 
 
 @app.post("/webhook")
@@ -117,58 +45,165 @@ async def webhook(request: Request):
     if not msg:
         return Response(status_code=200)
 
-    if msg.get("from", {}).get("is_bot"):
-        return Response(status_code=200)
-
-    chat = msg.get("chat", {})
-    chat_id = chat.get("id")
+    chat      = msg.get("chat", {})
+    chat_id   = chat.get("id")
     chat_type = chat.get("type", "")
-    text = (msg.get("text") or msg.get("caption") or "").strip()
-
+    text      = (msg.get("text") or msg.get("caption") or "").strip()
     from_user = msg.get("from", {})
-    user_id = from_user.get("id", 0)
-    username = from_user.get("username") or f"{from_user.get('first_name', '')} {from_user.get('last_name', '')}".strip()
-    thread_id = msg.get("message_thread_id")
 
-    # --- GROUP ---
-    if chat_id == GROUP_CHAT_ID:
-        # LOG EVERY group message to Supabase (async, non-blocking)
-        # This feeds the Finmap expense matching system
-        asyncio.create_task(log_to_supabase(update))
-
-        if not text:
-            return Response(status_code=200)
-
-        # Only RESPOND if: bot tagged, reply to bot, or active conversation
-        should_process = bot_mentioned(text) or is_reply_to_bot(msg) or is_active_user(user_id)
-
-        if not should_process:
-            return Response(status_code=200)
-
-        prompt = (
-            f"[ГРУПА ОБЛІК] Від: {username} | Тред: {thread_id or 'загальний'}\n"
-            f"{text}"
-        )
-        print(f"[group] from={username} thread={thread_id} text={text[:80]}")
-        reply = await send_to_agent(prompt)
-        if reply:
-            await send_telegram(chat_id, reply, thread_id)
-            if is_conversation_done(reply):
-                mark_user_done(user_id)
-                print(f"[done] user={username} — conversation closed")
-            else:
-                mark_user_active(user_id)
+    if from_user.get("is_bot"):
         return Response(status_code=200)
 
-    # --- PRIVATE: forward all messages ---
+    should_forward = False
+
     if chat_type == "private":
-        if not text:
-            return Response(status_code=200)
-        prompt = f"[ПРИВАТНЕ] Від: {username}\n{text}"
-        print(f"[private] from={username} text={text[:80]}")
-        reply = await send_to_agent(prompt)
-        if reply:
-            await send_telegram(chat_id, reply)
-        return Response(status_code=200)
+        should_forward = True
+    elif chat_id == GROUP_CHAT_ID and chat_type in ("group", "supergroup"):
+        if bot_mentioned(text):
+            should_forward = True
+
+    if should_forward:
+        await buffer_message(msg, update.get("update_id"))
 
     return Response(status_code=200)
+
+
+async def get_file_url(file_id: str) -> str | None:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{TG_API}/getFile", params={"file_id": file_id})
+            data = r.json()
+            if data.get("ok"):
+                file_path = data["result"]["file_path"]
+                return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+    except Exception as e:
+        print(f"[get_file_url] error: {e}")
+    return None
+
+
+async def extract_file_info(msg: dict) -> list[dict]:
+    """Extract all files from a message. Returns list of {name, mime, url}"""
+    files = []
+
+    # Document (Excel, PDF, Word, etc.)
+    doc = msg.get("document")
+    if doc:
+        url = await get_file_url(doc["file_id"])
+        files.append({
+            "name": doc.get("file_name", "file"),
+            "mime": doc.get("mime_type", ""),
+            "url": url or "[не вдалось отримати]"
+        })
+
+    # Photo
+    photos = msg.get("photo")
+    if photos:
+        photo = sorted(photos, key=lambda p: p.get("file_size", 0), reverse=True)[0]
+        url = await get_file_url(photo["file_id"])
+        files.append({
+            "name": "photo.jpg",
+            "mime": "image/jpeg",
+            "url": url or "[не вдалось отримати]"
+        })
+
+    return files
+
+
+async def buffer_message(msg: dict, update_id):
+    """Buffer messages from same user/chat/thread and flush after BUFFER_SECONDS of silence."""
+    from_user = msg.get("from", {})
+    chat      = msg.get("chat", {})
+    user_id   = from_user.get("id")
+    chat_id   = chat.get("id")
+    thread_id = msg.get("message_thread_id")
+
+    key = (chat_id, thread_id, user_id)
+
+    # Extract files now (async, before buffering)
+    files = await extract_file_info(msg)
+
+    entry = {
+        "update_id": update_id,
+        "msg": msg,
+        "files": files,
+        "text": (msg.get("text") or msg.get("caption") or "").strip(),
+    }
+
+    if key not in _buffer:
+        _buffer[key] = {"entries": [], "task": None}
+
+    _buffer[key]["entries"].append(entry)
+
+    # Cancel existing timer and restart
+    if _buffer[key]["task"] and not _buffer[key]["task"].done():
+        _buffer[key]["task"].cancel()
+
+    _buffer[key]["task"] = asyncio.create_task(flush_after_delay(key))
+
+
+async def flush_after_delay(key):
+    await asyncio.sleep(BUFFER_SECONDS)
+    await flush_buffer(key)
+
+
+async def flush_buffer(key):
+    if key not in _buffer:
+        return
+
+    entries = _buffer.pop(key)["entries"]
+    if not entries:
+        return
+
+    first     = entries[0]["msg"]
+    from_user = first.get("from", {})
+    chat      = first.get("chat", {})
+    username  = (
+        from_user.get("username")
+        or f"{from_user.get('first_name', '')} {from_user.get('last_name', '')}".strip()
+    )
+    chat_id   = chat.get("id")
+    chat_type = chat.get("type")
+    thread_id = first.get("message_thread_id")
+
+    # Collect all texts (skip duplicates/empty)
+    texts = []
+    for e in entries:
+        if e["text"] and e["text"] not in texts:
+            texts.append(e["text"])
+
+    # Collect all files
+    all_files = []
+    for e in entries:
+        all_files.extend(e["files"])
+
+    # Collect message IDs
+    msg_ids = [e["msg"]["message_id"] for e in entries]
+
+    # Build relay
+    relay = (
+        f"📨 TG_RELAY\n"
+        f"update_id: {entries[-1]['update_id']}\n"
+        f"chat_id: {chat_id}\n"
+        f"chat_type: {chat_type}\n"
+        f"thread_id: {thread_id}\n"
+        f"message_ids: {msg_ids}\n"
+        f"from: {username}\n"
+        f"messages_count: {len(entries)}\n"
+    )
+
+    if all_files:
+        relay += f"files_count: {len(all_files)}\n"
+        for i, f in enumerate(all_files, 1):
+            relay += f"📎 file_{i}: {f['name']} ({f['mime']})\n   url: {f['url']}\n"
+
+    relay += "---\n"
+    relay += "\n".join(texts) if texts else "(без тексту)"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": OWNER_CHAT_ID, "text": relay},
+        )
+        print(f"[flush] status={r.status_code} key={key} entries={len(entries)} files={len(all_files)}")
+        if r.status_code != 200:
+            print(f"[flush] error: {r.text[:200]}")
